@@ -1,0 +1,214 @@
+name: Build Offset Extractor (pinned upstream)
+
+# Builds the GhostLock kernel offset extractor from the upstream
+# YuKongA/ghostlock-app `tools/extract_rs` tree at a pinned commit, so the
+# binary is reproducible and does not depend on a moving branch.
+#
+# Upstream is Apache-2.0; see docs/THIRD_PARTY.md for attribution.
+#
+# Optional: pass a firmware URL to also derive an RMO-NX1 offset profile.
+# Without it the job only compiles the extractor and validates its CLI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_commit:
+        description: "Upstream commit to build the extractor from"
+        required: true
+        default: "6641116"
+        type: string
+      firmware_url:
+        description: "Direct URL to boot.img (empty = build-only)"
+        required: false
+        default: ""
+        type: string
+      firmware_xbl_url:
+        description: "Direct URL to xbl_config.img (optional)"
+        required: false
+        default: ""
+        type: string
+      kernel_string:
+        description: "Expected uname -r for sanity checking"
+        required: false
+        default: "5.4.274-qgki-g6bced53b6b8b"
+        type: string
+  push:
+    branches:
+      - rmo-nx1-5.4.274
+    paths:
+      - ".github/workflows/build-extractor.yml"
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: YuKongA/ghostlock-app
+  UPSTREAM_COMMIT: ${{ inputs.upstream_commit || '6641116' }}
+  EXPECTED_KERNEL: ${{ inputs.kernel_string || '5.4.274-qgki-g6bced53b6b8b' }}
+
+jobs:
+  extractor:
+    name: Build extractor
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream extractor source
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none "https://github.com/${UPSTREAM_REPO}.git" .extractor-src
+          cd .extractor-src
+          git checkout --quiet "${UPSTREAM_COMMIT}"
+          echo "upstream commit: $(git rev-parse HEAD)"
+          git log -1 --pretty='%h %s'
+          ls tools/extract_rs
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .extractor-src/tools/extract_rs/target
+          key: cargo-extractor-${{ runner.os }}-${{ env.UPSTREAM_COMMIT }}
+
+      - name: Build extractor
+        working-directory: .extractor-src/tools/extract_rs
+        run: |
+          set -euo pipefail
+          cargo build --release --features http 2>&1 | tee "${RUNNER_TEMP}/extractor-build.log"
+          find . -maxdepth 4 -name "ghostlock-extract" -type f -perm -u+x
+
+      - name: Locate and smoke-test binary
+        id: locate
+        run: |
+          set -euo pipefail
+          BIN=$(find "${GITHUB_WORKSPACE}/.extractor-src" -name "ghostlock-extract" -type f -perm -u+x | head -1)
+          if [ -z "${BIN}" ]; then
+            echo "::error title=Extractor missing::cargo build produced no ghostlock-extract binary"
+            exit 1
+          fi
+          echo "bin=${BIN}" >> "$GITHUB_OUTPUT"
+          mkdir -p out
+          cp "${BIN}" out/ghostlock-extract-linux-x86_64
+          chmod +x out/ghostlock-extract-linux-x86_64
+          out/ghostlock-extract-linux-x86_64 --help | head -40
+
+      - name: Build-only mode
+        if: inputs.firmware_url == ''
+        run: |
+          {
+            echo "### Build-only mode"
+            echo ""
+            echo "Extractor built from \`${UPSTREAM_REPO}\` at \`${UPSTREAM_COMMIT}\`."
+            echo "No firmware URL supplied, so no offset profile was produced."
+            echo "Re-dispatch with \`firmware_url\` set to generate one."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download firmware
+        if: inputs.firmware_url != ''
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/fw"
+          curl -fL --retry 3 --retry-delay 5 "${{ inputs.firmware_url }}" -o "${RUNNER_TEMP}/fw/boot.img"
+          if [ -n "${{ inputs.firmware_xbl_url }}" ]; then
+            curl -fL --retry 3 --retry-delay 5 "${{ inputs.firmware_xbl_url }}" -o "${RUNNER_TEMP}/fw/xbl_config.img"
+          fi
+          ls -l "${RUNNER_TEMP}/fw"
+          sha256sum "${RUNNER_TEMP}/fw"/* | tee "${RUNNER_TEMP}/firmware-sha256.txt"
+
+      - name: Verify firmware kernel string
+        if: inputs.firmware_url != ''
+        run: |
+          set -euo pipefail
+          FOUND=$(grep -a -o -m1 'Linux version [0-9][0-9.a-zA-Z_-]*' "${RUNNER_TEMP}/fw/boot.img" | head -1 || true)
+          {
+            echo "### Firmware kernel string"
+            echo ""
+            echo '```'
+            echo "found    : ${FOUND:-none}"
+            echo "expected : Linux version ${EXPECTED_KERNEL}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${FOUND}" ] && [ "${FOUND}" != "Linux version ${EXPECTED_KERNEL}" ]; then
+            echo "::warning title=Kernel mismatch::Firmware reports '${FOUND}', expected 'Linux version ${EXPECTED_KERNEL}'"
+          fi
+
+      - name: Extract offsets (HOCON + JSON)
+        if: inputs.firmware_url != ''
+        run: |
+          set -euo pipefail
+          BIN="${GITHUB_WORKSPACE}/out/ghostlock-extract-linux-x86_64"
+          ARGS=("${RUNNER_TEMP}/fw/boot.img")
+          if [ -f "${RUNNER_TEMP}/fw/xbl_config.img" ]; then
+            ARGS+=(--xbl-config "${RUNNER_TEMP}/fw/xbl_config.img")
+          fi
+          set +e
+          "${BIN}" "${ARGS[@]}" --format conf --out out/offsets.conf 2>&1 | tee "${RUNNER_TEMP}/extract.log"
+          CONF_RC=${PIPESTATUS[0]}
+          "${BIN}" "${ARGS[@]}" --format json --out out/offsets.json 2>&1 | tee -a "${RUNNER_TEMP}/extract.log"
+          JSON_RC=${PIPESTATUS[0]}
+          set -e
+          echo "conf_rc=${CONF_RC} json_rc=${JSON_RC}"
+          if [ "${CONF_RC}" -ne 0 ] || [ "${JSON_RC}" -ne 0 ]; then
+            echo "::error title=Extraction failed::extractor exited with conf=${CONF_RC} json=${JSON_RC}"
+            exit 1
+          fi
+          echo "--- offsets.conf ---"
+          cat out/offsets.conf
+
+      - name: Record extraction result
+        if: inputs.firmware_url != ''
+        run: |
+          set -euo pipefail
+          {
+            echo "### Offset extraction"
+            echo ""
+            echo "Candidate profile only — not evidence of device support."
+            echo ""
+            echo '```'
+            head -60 out/offsets.conf
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package outputs
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cd out
+          sha256sum ./* > SHA256SUMS 2>/dev/null || true
+          cat SHA256SUMS 2>/dev/null || true
+
+      - name: Upload extractor
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostlock-extract-${{ github.sha }}
+          path: out/ghostlock-extract-linux-x86_64
+          retention-days: 30
+
+      - name: Upload offset profile
+        if: inputs.firmware_url != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: rmo-nx1-offsets-${{ github.sha }}
+          path: out/
+          retention-days: 90
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extractor-logs-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/extractor-build.log
+            ${{ runner.temp }}/extract.log
+            ${{ runner.temp }}/firmware-sha256.txt
+          if-no-files-found: warn
+          retention-days: 14
