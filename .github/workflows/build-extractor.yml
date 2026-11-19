@@ -266,11 +266,12 @@ jobs:
           CC_aarch64_linux_android: ${{ env.NDK_DIR }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
           AR_aarch64_linux_android: ${{ env.NDK_DIR }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.NDK_DIR }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           set -euo pipefail
           cargo build --release --features http --target aarch64-linux-android 2>&1 \
             | tee "${RUNNER_TEMP}/android-build.log"
-          find . -maxdepth 5 -name "ghostlock-extract" -type f -perm -u+x
+          find "${GITHUB_WORKSPACE}/.extractor-src" -name "ghostlock-extract" -type f | head
 
       - name: Verify android binary
         run: |
@@ -280,15 +281,26 @@ jobs:
             echo "::error title=Android extractor missing::no aarch64-linux-android binary produced"
             exit 1
           fi
+          echo "resolved: ${BIN}"
           file "${BIN}"
           ls -l "${BIN}"
-          sha256sum "${BIN}" | tee "${RUNNER_TEMP}/android-sha256.txt"
+          mkdir -p out
+          cp "${BIN}" out/ghostlock-extract-android-arm64
+          chmod +x out/ghostlock-extract-android-arm64
+          FILE_OUT=$(file out/ghostlock-extract-android-arm64)
+          echo "${FILE_OUT}"
+          if ! echo "${FILE_OUT}" | grep -q "statically linked"; then
+            echo "::error title=Not static::android extractor is not statically linked and cannot run without a bionic linker on the device"
+            exit 1
+          fi
+          sha256sum out/ghostlock-extract-android-arm64 | tee "${RUNNER_TEMP}/android-sha256.txt"
 
       - name: Upload android extractor
         uses: actions/upload-artifact@v4
         with:
           name: ghostlock-extract-android-arm64
-          path: .extractor-src/tools/extract_rs/target/aarch64-linux-android/release/ghostlock-extract
+          path: out/ghostlock-extract-android-arm64
+          if-no-files-found: error
           retention-days: 30
 
       - name: Upload android build log
